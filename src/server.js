@@ -1,0 +1,64 @@
+// ---------------------------------------------------------------------------
+// voice-agent — entry point.
+//
+// Phase 1: HTTP-only. Express handles the Telnyx webhook; no WS yet.
+// Phase 2 will add a `ws` server upgrade for the audio bridge on the
+// same http.Server instance — we already create that instance manually
+// so Phase 2 is a one-import addition.
+// ---------------------------------------------------------------------------
+const http = require('http');
+const express = require('express');
+
+const config = require('./config');
+const telnyxWebhook = require('./routes/telnyxWebhook');
+
+const app = express();
+
+// Telnyx signs the RAW request body. We must capture the bytes
+// untouched for verification — Express's default `express.json()` would
+// re-stringify and break the signature. Use `express.raw` for the
+// webhook path only and parse JSON ourselves inside the route handler.
+app.use(
+  '/api/telnyx/webhook',
+  express.raw({ type: '*/*', limit: '1mb' }),
+);
+
+// All other routes get JSON parsing (e.g. /health, future admin pings).
+app.use(express.json());
+
+app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    service: 'voice-agent',
+    phase: 1,
+    time: new Date().toISOString(),
+  });
+});
+
+app.use('/api/telnyx', telnyxWebhook);
+
+app.use((_req, res) => res.status(404).json({ error: 'not_found' }));
+
+const server = http.createServer(app);
+
+server.listen(config.port, () => {
+  console.log(`[voice-agent] listening on :${config.port}`);
+  if (!config.telnyx.apiKey) {
+    console.warn('[voice-agent] TELNYX_API_KEY missing — Call Control commands will fail');
+  }
+  if (!config.telnyx.publicKey) {
+    console.warn(
+      '[voice-agent] TELNYX_PUBLIC_KEY missing — webhook signature verification is DISABLED',
+    );
+  }
+});
+
+// Graceful shutdown so Railway rolling deploys don't drop calls.
+function shutdown(signal) {
+  console.log(`[voice-agent] received ${signal} — shutting down`);
+  server.close(() => process.exit(0));
+  // Hard exit after 10s in case a hung connection holds the close.
+  setTimeout(() => process.exit(1), 10_000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
