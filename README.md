@@ -77,3 +77,4 @@ Control Application's webhook URL at `https://<your-ngrok>/api/telnyx/webhook`.
 Phase 2 will swap the `speak → hangup` block in `routes/telnyxWebhook.js`
 for `telnyx.startMediaStreaming(...)` pointing at a new WS handler that
 bridges audio to OpenAI Realtime.
+# voice-agent
