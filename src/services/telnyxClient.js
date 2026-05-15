@@ -97,4 +97,18 @@ async function transfer(callControlId, toNumber) {
   return data;
 }
 
-module.exports = { answer, speak, hangup, startMediaStreaming, transfer };
+/**
+ * Play a remote audio file (MP3/WAV URL) to the caller.
+ * Used instead of speak() for languages Telnyx TTS doesn't support (e.g. he-IL).
+ * Fires call.playback.ended when done.
+ */
+async function playAudio(callControlId, audioUrl) {
+  ensureKey();
+  const { data } = await http.post(
+    `/calls/${encodeURIComponent(callControlId)}/actions/playback_start`,
+    { audio_url: audioUrl },
+  );
+  return data;
+}
+
+module.exports = { answer, speak, hangup, startMediaStreaming, transfer, playAudio };

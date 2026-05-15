@@ -27,6 +27,7 @@ const telnyx = require('../services/telnyxClient');
 const { verifyTelnyxSignature } = require('../services/telnyxSignature');
 const { findClinicByTelnyxNumber } = require('../services/clinicLookup');
 const repo = require('../services/callSessionRepo');
+const openaiTts = require('../services/openaiTts');
 
 // Calls for which we issued a "farewell speak" — when speak.ended
 // fires for these, we should hang up immediately. Cleared on hangup.
@@ -90,6 +91,8 @@ async function processEvent(payload) {
       return handleAnswered(ev, callControlId);
     case 'call.speak.ended':
       return handleSpeakEnded(callControlId);
+    case 'call.playback.ended':
+      return handleSpeakEnded(callControlId); // same teardown logic
     case 'call.hangup':
       return handleHangup(callControlId);
     default:
@@ -158,9 +161,11 @@ async function handleAnswered(ev, callControlId) {
   if (!session) {
     farewellCalls.add(callControlId);
     try {
-      await telnyx.speak(callControlId, WRONG_NUMBER_HE, 'he-IL');
+      const { key } = await openaiTts.generateSpeech(WRONG_NUMBER_HE);
+      const audioUrl = `https://${config.publicHostname}/api/audio/${key}`;
+      await telnyx.playAudio(callControlId, audioUrl);
     } catch (err) {
-      console.error('[telnyx/webhook] wrong-number speak failed:', JSON.stringify(err.response?.data ?? err.message, null, 2));
+      console.error('[telnyx/webhook] wrong-number playback failed:', JSON.stringify(err.response?.data ?? err.message, null, 2));
       await telnyx.hangup(callControlId).catch(() => {});
     }
     return;
@@ -177,9 +182,11 @@ async function handleAnswered(ev, callControlId) {
   // pointing at our wss:// audio bridge.
   farewellCalls.add(callControlId);
   try {
-    await telnyx.speak(callControlId, greeting, 'he-IL');
+    const { key } = await openaiTts.generateSpeech(greeting);
+    const audioUrl = `https://${config.publicHostname}/api/audio/${key}`;
+    await telnyx.playAudio(callControlId, audioUrl);
   } catch (err) {
-    console.error('[telnyx/webhook] greeting speak failed:', JSON.stringify(err.response?.data ?? err.message, null, 2));
+    console.error('[telnyx/webhook] greeting playback failed:', JSON.stringify(err.response?.data ?? err.message, null, 2));
     await telnyx.hangup(callControlId).catch(() => {});
   }
 }
