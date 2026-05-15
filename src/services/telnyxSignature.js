@@ -28,6 +28,13 @@ function verifyTelnyxSignature(rawBody, headers) {
 
   const signature = headers['telnyx-signature-ed25519'];
   const timestamp = headers['telnyx-timestamp'];
+  console.log('[telnyxSignature] DEBUG headers present:', {
+    hasSig: !!signature,
+    hasTsHeader: !!timestamp,
+    sigLen: signature?.length,
+    pubKeyFirst8: config.telnyx.publicKey?.slice(0, 8),
+    rawBodyLen: rawBody?.length,
+  });
   if (!signature || !timestamp) return false;
 
   const tsNum = Number(timestamp);
@@ -48,7 +55,9 @@ function verifyTelnyxSignature(rawBody, headers) {
     const derKey = Buffer.concat([ED25519_SPKI_PREFIX, rawKey]);
     const publicKey = crypto.createPublicKey({ key: derKey, format: 'der', type: 'spki' });
     const sigBuf = Buffer.from(signature, 'base64');
-    return crypto.verify(null, message, publicKey, sigBuf);
+    const result = crypto.verify(null, message, publicKey, sigBuf);
+    console.log('[telnyxSignature] DEBUG verify result:', result, 'msgLen:', message.length);
+    return result;
   } catch (err) {
     console.error('[telnyxSignature] verify error:', err.message);
     return false;
