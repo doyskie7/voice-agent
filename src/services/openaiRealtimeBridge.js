@@ -103,7 +103,8 @@ class RealtimeBridge {
     this.openaiWs = new WebSocket(url, {
       headers: {
         Authorization: `Bearer ${config.openai.apiKey}`,
-        'OpenAI-Beta': 'realtime=v1',
+        // No `OpenAI-Beta: realtime=v1` — Realtime is GA. Sending the
+        // beta header is now rejected with beta_api_shape_disabled.
       },
     });
     this.openaiWs.on('open', () => this.onOpenAIOpen());
@@ -124,24 +125,37 @@ class RealtimeBridge {
       `${FALLBACK_INSTRUCTIONS_HE}\n\nשם המרפאה: ${clinicName}.\n` +
       `ברכת פתיחה לדבר ראשון: "${this.greeting}".`;
 
+    // GA Realtime session shape (post Aug 2025). Major differences
+    // from the beta shape used previously:
+    //   - audio.input.format / audio.output.format are OBJECTS, not
+    //     plain strings. PCMU = { type: 'audio/pcmu' }.
+    //   - voice lives under audio.output.voice
+    //   - transcription + turn_detection move under audio.input.*
+    //   - modalities → output_modalities (audio-only here; text comes
+    //     back via response.output_audio_transcript.* events)
     this.sendOpenAI({
       type: 'session.update',
       session: {
-        modalities: ['audio', 'text'],
         instructions,
-        // 'shimmer' tends to sound the warmest in he-IL among the
-        // OpenAI Realtime voices and works well for clinic UX.
-        voice: 'shimmer',
-        input_audio_format: 'g711_ulaw',
-        output_audio_format: 'g711_ulaw',
-        input_audio_transcription: { model: 'whisper-1' },
-        turn_detection: {
-          type: 'server_vad',
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 500,
+        output_modalities: ['audio'],
+        audio: {
+          input: {
+            format: { type: 'audio/pcmu' },
+            transcription: { model: 'whisper-1' },
+            turn_detection: {
+              type: 'server_vad',
+              threshold: 0.5,
+              prefix_padding_ms: 300,
+              silence_duration_ms: 500,
+            },
+          },
+          output: {
+            format: { type: 'audio/pcmu' },
+            // 'shimmer' tends to sound the warmest in he-IL among the
+            // OpenAI Realtime voices and works well for clinic UX.
+            voice: 'shimmer',
+          },
         },
-        temperature: 0.8,
       },
     });
     this.openaiReady = true;
@@ -169,7 +183,8 @@ class RealtimeBridge {
     this.sendOpenAI({
       type: 'response.create',
       response: {
-        modalities: ['audio'],
+        // GA: output_modalities (was `modalities` in beta).
+        output_modalities: ['audio'],
         instructions: `אמור עכשיו את ברכת הפתיחה הבאה בעברית בקול חם וטבעי: "${this.greeting}". אל תוסיף דבר אחריה — חכה שהמתקשר ידבר.`,
       },
     });
@@ -241,6 +256,11 @@ class RealtimeBridge {
       return;
     }
     switch (msg.type) {
+      // GA event names. The old beta names (response.audio.delta,
+      // response.audio.done, response.audio_transcript.done) were
+      // renamed during the GA migration — keep the old names too as
+      // a fallback in case OpenAI ever ships compatibility events.
+      case 'response.output_audio.delta':
       case 'response.audio.delta':
         this.sendTelnyxMedia(msg.delta);
         return;
@@ -251,6 +271,7 @@ class RealtimeBridge {
         this.sendTelnyx({ event: 'clear', stream_id: this.streamId });
         return;
       case 'response.done':
+      case 'response.output_audio.done':
       case 'response.audio.done':
       case 'session.created':
       case 'session.updated':
@@ -261,6 +282,7 @@ class RealtimeBridge {
       case 'conversation.item.input_audio_transcription.completed':
         if (msg.transcript) console.log(`[bridge] caller said: "${msg.transcript}"`);
         return;
+      case 'response.output_audio_transcript.done':
       case 'response.audio_transcript.done':
         if (msg.transcript) console.log(`[bridge] AI said: "${msg.transcript}"`);
         return;
