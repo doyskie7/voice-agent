@@ -40,11 +40,13 @@ function verifyTelnyxSignature(rawBody, headers) {
 
   const message = Buffer.from(`${timestamp}|${rawBody}`, 'utf8');
   try {
-    const publicKey = crypto.createPublicKey({
-      key: Buffer.from(config.telnyx.publicKey, 'base64'),
-      format: 'der',
-      type: 'spki',
-    });
+    // Telnyx provides a raw 32-byte Ed25519 public key in base64. Node's
+    // createPublicKey requires DER/SPKI format, which prepends a fixed
+    // 12-byte algorithm identifier header to the raw key bytes.
+    const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+    const rawKey = Buffer.from(config.telnyx.publicKey, 'base64');
+    const derKey = Buffer.concat([ED25519_SPKI_PREFIX, rawKey]);
+    const publicKey = crypto.createPublicKey({ key: derKey, format: 'der', type: 'spki' });
     const sigBuf = Buffer.from(signature, 'base64');
     return crypto.verify(null, message, publicKey, sigBuf);
   } catch (err) {
