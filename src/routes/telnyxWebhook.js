@@ -160,7 +160,7 @@ async function handleAnswered(ev, callControlId) {
     try {
       await telnyx.speak(callControlId, WRONG_NUMBER_HE, 'he-IL');
     } catch (err) {
-      console.error('[telnyx/webhook] wrong-number speak failed:', err.response?.data || err.message);
+      console.error('[telnyx/webhook] wrong-number speak failed:', JSON.stringify(err.response?.data ?? err.message, null, 2));
       await telnyx.hangup(callControlId).catch(() => {});
     }
     return;
@@ -179,7 +179,7 @@ async function handleAnswered(ev, callControlId) {
   try {
     await telnyx.speak(callControlId, greeting, 'he-IL');
   } catch (err) {
-    console.error('[telnyx/webhook] greeting speak failed:', err.response?.data || err.message);
+    console.error('[telnyx/webhook] greeting speak failed:', JSON.stringify(err.response?.data ?? err.message, null, 2));
     await telnyx.hangup(callControlId).catch(() => {});
   }
 }
