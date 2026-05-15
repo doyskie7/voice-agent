@@ -135,6 +135,16 @@ async function handleAnswered(ev, callControlId) {
   // Telnyx will dial this URL to push/pull audio frames. The path must
   // match the WS upgrade handler in server.js.
   const streamUrl = `wss://${config.publicHostname}/ws/media`;
+
+  // Open the OpenAI Realtime WS NOW, in parallel with streaming_start,
+  // so by the time Telnyx connects to /ws/media the AI is already
+  // configured and can start speaking immediately. This shaves ~1s of
+  // silence after pickup, which is the difference between callers
+  // hearing the greeting vs. hanging up thinking the line is dead.
+  realtimeBridge.prepare(callControlId).catch((err) =>
+    console.error('[telnyx/webhook] bridge prepare failed:', err.message),
+  );
+
   try {
     console.log(`[telnyx/webhook] streaming_start → ${streamUrl}`);
     await telnyx.startMediaStreaming(callControlId, streamUrl);
@@ -143,6 +153,7 @@ async function handleAnswered(ev, callControlId) {
       '[telnyx/webhook] streaming_start failed:',
       JSON.stringify(err.response?.data ?? err.message, null, 2),
     );
+    realtimeBridge.shutdownBridgeByCallControlId(callControlId, 'streaming_start_failed');
     await telnyx.hangup(callControlId).catch(() => {});
   }
 }
