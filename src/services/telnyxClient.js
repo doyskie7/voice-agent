@@ -44,11 +44,11 @@ async function answer(callControlId) {
  * @param {string}  language — Telnyx voice locale, e.g. 'he-IL', 'en-US', 'ar-XA'
  * @param {string}  voice    — Telnyx voice, e.g. 'female', 'male', or a specific Polly voice
  */
-async function speak(callControlId, text, language = 'he-IL', voice = 'female') {
+async function speak(callControlId, text, language = 'he-IL', voice = 'Shlomo') {
   ensureKey();
   const { data } = await http.post(
     `/calls/${encodeURIComponent(callControlId)}/actions/speak`,
-    { payload: text, language, voice },
+    { payload: text, language, voice, service_level: 'basic' },
   );
   return data;
 }
