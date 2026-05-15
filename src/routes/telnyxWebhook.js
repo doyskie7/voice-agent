@@ -1,11 +1,13 @@
 // ---------------------------------------------------------------------------
 // POST /api/telnyx/webhook
 //
-// Phase 1 scope:
-//   call.initiated      → look up clinic; kick off TTS pre-fetch; answer
-//   call.answered       → await pre-fetched audio; playback_start immediately
-//   call.playback.ended → hangup (farewell calls only)
-//   call.hangup         → mark call_sessions row completed
+// Phase 2 scope (streaming):
+//   call.initiated  → look up clinic, persist call_sessions row, answer
+//   call.answered   → streaming_start — Telnyx opens WS to /ws/media
+//                     where the OpenAI Realtime bridge takes over. The
+//                     bridge speaks the greeting itself (no playAudio).
+//   call.hangup     → mark call_sessions completed; bridge teardown is
+//                     driven by the WS close from Telnyx
 // ---------------------------------------------------------------------------
 const express = require('express');
 const router = express.Router();
@@ -15,15 +17,7 @@ const telnyx = require('../services/telnyxClient');
 const { verifyTelnyxSignature } = require('../services/telnyxSignature');
 const { findClinicByTelnyxNumber } = require('../services/clinicLookup');
 const repo = require('../services/callSessionRepo');
-const openaiTts = require('../services/openaiTts');
-
-// Calls for which we issued a farewell playback — hang up when playback ends.
-const farewellCalls = new Set();
-
-// Greeting text per call, set at call.initiated, read at call.answered so
-// we know what to speak. We deliberately do NOT pre-generate any audio —
-// telnyx.speak (Polly Hebrew Carmit) plays server-side, no fetch needed.
-const pendingGreeting = new Map();
+const realtimeBridge = require('../services/openaiRealtimeBridge');
 
 const DEFAULT_GREETING_HE =
   'שלום, הגעתם לקליניקה. אנא המתינו בקו, נציג ייצור איתכם קשר בקרוב.';
@@ -71,21 +65,19 @@ async function processEvent(payload) {
       return handleInitiated(ev, callControlId, callLegId);
     case 'call.answered':
       return handleAnswered(ev, callControlId);
-    case 'call.playback.ended':
-    case 'call.speak.ended':
-      return handlePlaybackEnded(callControlId);
     case 'call.hangup':
       return handleHangup(callControlId);
-    case 'call.playback.command.failed':
-    case 'call.speak.command.failed':
-      console.error(
+    case 'streaming.started':
+    case 'streaming.stopped':
+    case 'streaming.failed':
+      console.log(
         `[telnyx/webhook] ${eventType}:`,
-        JSON.stringify(ev, null, 2),
+        JSON.stringify({
+          stream_id: ev.stream_id,
+          stream_url: ev.stream_url,
+          reason: ev.reason || ev.failure_reason,
+        }),
       );
-      // Telnyx couldn't play the audio (URL fetch failed, codec issue,
-      // etc.) — hang up so the caller isn't stuck in silence.
-      farewellCalls.delete(callControlId);
-      await telnyx.hangup(callControlId).catch(() => {});
       return;
     default:
       console.log(`[telnyx/webhook] ignoring event ${eventType}`);
@@ -103,19 +95,17 @@ async function handleInitiated(ev, callControlId, callLegId) {
   const clinic = await findClinicByTelnyxNumber(toNumber);
 
   if (!clinic) {
-    console.warn(`[telnyx/webhook] no clinic mapping for ${toNumber} — answering with wrong-number greeting`);
-    pendingGreeting.set(callControlId, WRONG_NUMBER_HE);
+    console.warn(`[telnyx/webhook] no clinic mapping for ${toNumber} — hanging up`);
+    // Without a clinic we have no system prompt and no booking context.
+    // Reject early instead of streaming silence — the caller hears the
+    // line drop, which is the right UX for a wrong number.
     try {
-      await telnyx.answer(callControlId);
+      await telnyx.hangup(callControlId);
     } catch (err) {
-      console.error('[telnyx/webhook] answer failed for unmapped number:', err.response?.data || err.message);
-      pendingGreeting.delete(callControlId);
+      // Best-effort — if hangup fails the call will time out anyway.
     }
     return;
   }
-
-  const greeting = clinic.clinics_digilux?.welcome_message_he || DEFAULT_GREETING_HE;
-  pendingGreeting.set(callControlId, greeting);
 
   await repo.createCallSession({
     clinicId: clinic.clinic_id,
@@ -129,7 +119,6 @@ async function handleInitiated(ev, callControlId, callLegId) {
     await telnyx.answer(callControlId);
   } catch (err) {
     console.error('[telnyx/webhook] answer failed:', err.response?.data || err.message);
-    pendingGreeting.delete(callControlId);
     await repo.markCompleted(callControlId, { status: 'failed' });
   }
 }
@@ -137,45 +126,31 @@ async function handleInitiated(ev, callControlId, callLegId) {
 async function handleAnswered(ev, callControlId) {
   await repo.markAnswered(callControlId);
 
-  // Resolve greeting text recorded at call.initiated. Fall back to the
-  // default Hebrew greeting if the entry is missing.
-  const greeting = pendingGreeting.get(callControlId) || DEFAULT_GREETING_HE;
-  pendingGreeting.delete(callControlId);
+  if (!config.publicHostname) {
+    console.error('[telnyx/webhook] PUBLIC_HOSTNAME missing — cannot start media streaming');
+    await telnyx.hangup(callControlId).catch(() => {});
+    return;
+  }
 
-  farewellCalls.add(callControlId);
+  // Telnyx will dial this URL to push/pull audio frames. The path must
+  // match the WS upgrade handler in server.js.
+  const streamUrl = `wss://${config.publicHostname}/ws/media`;
   try {
-    // Telnyx's native Polly TTS does NOT support he-IL. We generate the
-    // MP3 with OpenAI TTS (cache is pre-warmed at boot, so this is an
-    // instant Map lookup) and hand Telnyx a URL to fetch via playback_start.
-    const { key } = await openaiTts.generateSpeech(greeting);
-    const audioUrl = `https://${config.publicHostname}/api/audio/${key}.mp3`;
-    console.log(`[telnyx/webhook] playAudio → ${audioUrl}`);
-    await telnyx.playAudio(callControlId, audioUrl);
+    console.log(`[telnyx/webhook] streaming_start → ${streamUrl}`);
+    await telnyx.startMediaStreaming(callControlId, streamUrl);
   } catch (err) {
-    console.error('[telnyx/webhook] playback failed:', JSON.stringify(err.response?.data ?? err.message, null, 2));
+    console.error(
+      '[telnyx/webhook] streaming_start failed:',
+      JSON.stringify(err.response?.data ?? err.message, null, 2),
+    );
     await telnyx.hangup(callControlId).catch(() => {});
   }
 }
 
-async function handlePlaybackEnded(callControlId) {
-  if (!farewellCalls.has(callControlId)) return;
-  farewellCalls.delete(callControlId);
-  try {
-    await telnyx.hangup(callControlId);
-  } catch (err) {
-    // 404 = call already gone; 90018 = 'Call has already ended' (caller
-    // hung up first). Both are benign — we only wanted to ensure the
-    // call is closed and Telnyx already did it for us.
-    const status = err.response?.status;
-    const code = err.response?.data?.errors?.[0]?.code;
-    if (status === 404 || code === '90018') return;
-    console.error('[telnyx/webhook] hangup failed:', err.response?.data || err.message);
-  }
-}
-
 async function handleHangup(callControlId) {
-  farewellCalls.delete(callControlId);
-  pendingGreeting.delete(callControlId);
+  // Tear down the bridge if it's still alive (Telnyx normally closes
+  // the WS first, but on abrupt disconnects this is the backstop).
+  realtimeBridge.shutdownBridgeByCallControlId(callControlId, 'call_hangup');
   await repo.markCompleted(callControlId, { status: 'completed' });
 }
 

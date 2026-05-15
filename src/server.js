@@ -1,17 +1,19 @@
 // ---------------------------------------------------------------------------
 // voice-agent — entry point.
 //
-// Phase 1: HTTP-only. Express handles the Telnyx webhook; no WS yet.
-// Phase 2 will add a `ws` server upgrade for the audio bridge on the
-// same http.Server instance — we already create that instance manually
-// so Phase 2 is a one-import addition.
+// Phase 2: streaming. Express handles the Telnyx webhook (events) and
+// a `ws` server upgrade at /ws/media handles the bidirectional audio
+// stream that gets bridged into OpenAI Realtime. Both share the same
+// http.Server instance.
 // ---------------------------------------------------------------------------
 const http = require('http');
 const express = require('express');
+const { WebSocketServer } = require('ws');
 
 const config = require('./config');
 const telnyxWebhook = require('./routes/telnyxWebhook');
 const openaiTts = require('./services/openaiTts');
+const realtimeBridge = require('./services/openaiRealtimeBridge');
 
 const app = express();
 
@@ -96,8 +98,26 @@ app.use((_req, res) => res.status(404).json({ error: 'not_found' }));
 
 const server = http.createServer(app);
 
+// WebSocket server for Telnyx Media Streaming. Telnyx connects here
+// after we issue streaming_start in the webhook handler. We attach a
+// per-call RealtimeBridge that proxies audio frames to OpenAI Realtime.
+//
+// noServer:true so we hook the upgrade event manually — lets us reject
+// any path other than /ws/media without spinning up a second listener.
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  if (req.url !== '/ws/media') {
+    socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+    return socket.destroy();
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    realtimeBridge.attachToWebSocket(ws);
+  });
+});
+
 server.listen(config.port, () => {
-  console.log(`[voice-agent] listening on :${config.port}`);
+  console.log(`[voice-agent] listening on :${config.port} (HTTP + WS /ws/media)`);
   if (!config.telnyx.apiKey) {
     console.warn('[voice-agent] TELNYX_API_KEY missing — Call Control commands will fail');
   }
@@ -106,9 +126,14 @@ server.listen(config.port, () => {
       '[voice-agent] TELNYX_PUBLIC_KEY missing — webhook signature verification is DISABLED',
     );
   }
-  // Fire-and-forget — pre-generate greeting audio so the first inbound
-  // call doesn't time out on TTS. See openaiTts.prewarmGreetings docstring.
-  openaiTts.prewarmGreetings();
+  if (!config.openai.apiKey) {
+    console.warn('[voice-agent] OPENAI_API_KEY missing — Realtime bridge will fail');
+  }
+  if (!config.publicHostname) {
+    console.warn(
+      '[voice-agent] PUBLIC_HOSTNAME missing — streaming_start cannot build a wss:// URL',
+    );
+  }
 });
 
 // Graceful shutdown so Railway rolling deploys don't drop calls.
