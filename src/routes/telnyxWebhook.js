@@ -76,6 +76,17 @@ async function processEvent(payload) {
       return handlePlaybackEnded(callControlId);
     case 'call.hangup':
       return handleHangup(callControlId);
+    case 'call.playback.command.failed':
+    case 'call.speak.command.failed':
+      console.error(
+        `[telnyx/webhook] ${eventType}:`,
+        JSON.stringify(ev, null, 2),
+      );
+      // Telnyx couldn't play the audio (URL fetch failed, codec issue,
+      // etc.) — hang up so the caller isn't stuck in silence.
+      farewellCalls.delete(callControlId);
+      await telnyx.hangup(callControlId).catch(() => {});
+      return;
     default:
       console.log(`[telnyx/webhook] ignoring event ${eventType}`);
   }
@@ -126,19 +137,22 @@ async function handleInitiated(ev, callControlId, callLegId) {
 async function handleAnswered(ev, callControlId) {
   await repo.markAnswered(callControlId);
 
-  // Resolve greeting text recorded at call.initiated. If call.answered
-  // arrives without a prior initiated entry (unlikely — implies events
-  // landed on a different process), fall back to the default greeting.
+  // Resolve greeting text recorded at call.initiated. Fall back to the
+  // default Hebrew greeting if the entry is missing.
   const greeting = pendingGreeting.get(callControlId) || DEFAULT_GREETING_HE;
   pendingGreeting.delete(callControlId);
 
   farewellCalls.add(callControlId);
   try {
-    // telnyx.speak generates audio server-side via Polly (he-IL Carmit)
-    // and starts playback within ~200ms — no audio_url round-trip.
-    await telnyx.speak(callControlId, greeting);
+    // Telnyx's native Polly TTS does NOT support he-IL. We generate the
+    // MP3 with OpenAI TTS (cache is pre-warmed at boot, so this is an
+    // instant Map lookup) and hand Telnyx a URL to fetch via playback_start.
+    const { key } = await openaiTts.generateSpeech(greeting);
+    const audioUrl = `https://${config.publicHostname}/api/audio/${key}.mp3`;
+    console.log(`[telnyx/webhook] playAudio → ${audioUrl}`);
+    await telnyx.playAudio(callControlId, audioUrl);
   } catch (err) {
-    console.error('[telnyx/webhook] speak failed:', JSON.stringify(err.response?.data ?? err.message, null, 2));
+    console.error('[telnyx/webhook] playback failed:', JSON.stringify(err.response?.data ?? err.message, null, 2));
     await telnyx.hangup(callControlId).catch(() => {});
   }
 }
