@@ -62,6 +62,9 @@ server.listen(config.port, () => {
       '[voice-agent] TELNYX_PUBLIC_KEY missing — webhook signature verification is DISABLED',
     );
   }
+  // Fire-and-forget — pre-generate greeting audio so the first inbound
+  // call doesn't time out on TTS. See openaiTts.prewarmGreetings docstring.
+  openaiTts.prewarmGreetings();
 });
 
 // Graceful shutdown so Railway rolling deploys don't drop calls.
