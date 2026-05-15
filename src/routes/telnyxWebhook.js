@@ -20,9 +20,10 @@ const openaiTts = require('../services/openaiTts');
 // Calls for which we issued a farewell playback — hang up when playback ends.
 const farewellCalls = new Set();
 
-// TTS is pre-generated during call.initiated so it's ready by call.answered.
-// Key: callControlId → Promise<{ key: string }>
-const pendingAudio = new Map();
+// Greeting text per call, set at call.initiated, read at call.answered so
+// we know what to speak. We deliberately do NOT pre-generate any audio —
+// telnyx.speak (Polly Hebrew Carmit) plays server-side, no fetch needed.
+const pendingGreeting = new Map();
 
 const DEFAULT_GREETING_HE =
   'שלום, הגעתם לקליניקה. אנא המתינו בקו, נציג ייצור איתכם קשר בקרוב.';
@@ -92,22 +93,18 @@ async function handleInitiated(ev, callControlId, callLegId) {
 
   if (!clinic) {
     console.warn(`[telnyx/webhook] no clinic mapping for ${toNumber} — answering with wrong-number greeting`);
-    // Pre-fetch wrong-number audio in parallel with answering.
-    pendingAudio.set(callControlId, openaiTts.generateSpeech(WRONG_NUMBER_HE));
+    pendingGreeting.set(callControlId, WRONG_NUMBER_HE);
     try {
       await telnyx.answer(callControlId);
     } catch (err) {
       console.error('[telnyx/webhook] answer failed for unmapped number:', err.response?.data || err.message);
-      pendingAudio.delete(callControlId);
+      pendingGreeting.delete(callControlId);
     }
     return;
   }
 
   const greeting = clinic.clinics_digilux?.welcome_message_he || DEFAULT_GREETING_HE;
-
-  // Kick off TTS generation NOW, in parallel with the DB write + answer,
-  // so the audio is ready (or nearly ready) by the time call.answered fires.
-  pendingAudio.set(callControlId, openaiTts.generateSpeech(greeting));
+  pendingGreeting.set(callControlId, greeting);
 
   await repo.createCallSession({
     clinicId: clinic.clinic_id,
@@ -121,7 +118,7 @@ async function handleInitiated(ev, callControlId, callLegId) {
     await telnyx.answer(callControlId);
   } catch (err) {
     console.error('[telnyx/webhook] answer failed:', err.response?.data || err.message);
-    pendingAudio.delete(callControlId);
+    pendingGreeting.delete(callControlId);
     await repo.markCompleted(callControlId, { status: 'failed' });
   }
 }
@@ -129,23 +126,19 @@ async function handleInitiated(ev, callControlId, callLegId) {
 async function handleAnswered(ev, callControlId) {
   await repo.markAnswered(callControlId);
 
-  // Retrieve the pre-fetched TTS promise (started during call.initiated).
-  const audioPromise = pendingAudio.get(callControlId);
-  pendingAudio.delete(callControlId);
-
-  // Fallback if call.answered fires without a prior call.initiated (unlikely).
-  const session = await repo.findByCallControlId(callControlId);
-  const fallbackText = session
-    ? null  // will use audioPromise which already has the right text
-    : WRONG_NUMBER_HE;
+  // Resolve greeting text recorded at call.initiated. If call.answered
+  // arrives without a prior initiated entry (unlikely — implies events
+  // landed on a different process), fall back to the default greeting.
+  const greeting = pendingGreeting.get(callControlId) || DEFAULT_GREETING_HE;
+  pendingGreeting.delete(callControlId);
 
   farewellCalls.add(callControlId);
   try {
-    const { key } = await (audioPromise || openaiTts.generateSpeech(fallbackText || DEFAULT_GREETING_HE));
-    const audioUrl = `https://${config.publicHostname}/api/audio/${key}`;
-    await telnyx.playAudio(callControlId, audioUrl);
+    // telnyx.speak generates audio server-side via Polly (he-IL Carmit)
+    // and starts playback within ~200ms — no audio_url round-trip.
+    await telnyx.speak(callControlId, greeting);
   } catch (err) {
-    console.error('[telnyx/webhook] playback failed:', JSON.stringify(err.response?.data ?? err.message, null, 2));
+    console.error('[telnyx/webhook] speak failed:', JSON.stringify(err.response?.data ?? err.message, null, 2));
     await telnyx.hangup(callControlId).catch(() => {});
   }
 }
@@ -156,15 +149,19 @@ async function handlePlaybackEnded(callControlId) {
   try {
     await telnyx.hangup(callControlId);
   } catch (err) {
-    if (err.response?.status !== 404) {
-      console.error('[telnyx/webhook] hangup failed:', err.response?.data || err.message);
-    }
+    // 404 = call already gone; 90018 = 'Call has already ended' (caller
+    // hung up first). Both are benign — we only wanted to ensure the
+    // call is closed and Telnyx already did it for us.
+    const status = err.response?.status;
+    const code = err.response?.data?.errors?.[0]?.code;
+    if (status === 404 || code === '90018') return;
+    console.error('[telnyx/webhook] hangup failed:', err.response?.data || err.message);
   }
 }
 
 async function handleHangup(callControlId) {
   farewellCalls.delete(callControlId);
-  pendingAudio.delete(callControlId);
+  pendingGreeting.delete(callControlId);
   await repo.markCompleted(callControlId, { status: 'completed' });
 }
 

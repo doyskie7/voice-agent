@@ -44,11 +44,16 @@ async function answer(callControlId) {
  * @param {string}  language — Telnyx voice locale, e.g. 'he-IL', 'en-US', 'ar-XA'
  * @param {string}  voice    — Telnyx voice, e.g. 'female', 'male', or a specific Polly voice
  */
-async function speak(callControlId, text, language = 'he-IL', voice = 'Shlomo') {
+async function speak(callControlId, text, language = 'he-IL', voice = 'Polly.Carmit') {
   ensureKey();
+  // Polly.Carmit is AWS Polly's Hebrew (he-IL) voice. Telnyx routes
+  // Polly.* voice names to Polly directly, server-side — there is no
+  // audio file for us to host and no fetch round-trip for Telnyx, so
+  // playback starts within ~200ms of the speak command. This is the
+  // single most reliable Phase 1 greeting path.
   const { data } = await http.post(
     `/calls/${encodeURIComponent(callControlId)}/actions/speak`,
-    { payload: text, language, voice, service_level: 'basic' },
+    { payload: text, language, voice, service_level: 'premium' },
   );
   return data;
 }
