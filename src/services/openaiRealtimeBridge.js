@@ -116,6 +116,20 @@ class RealtimeBridge {
     this.openaiWs.on('error', (err) => {
       console.error('[bridge] openai ws error:', err.message);
     });
+    // The default 'error' event for a handshake rejection just says
+    // "closed before established", which hides the real reason. The
+    // 'unexpected-response' event exposes the HTTP status and body so
+    // we can see e.g. 401 (bad key), 403 (no Realtime access), 404
+    // (unknown model). Without this listener we'd be flying blind.
+    this.openaiWs.on('unexpected-response', (_req, res) => {
+      let body = '';
+      res.on('data', (chunk) => { body += chunk.toString(); });
+      res.on('end', () => {
+        console.error(
+          `[bridge] openai ws upgrade rejected status=${res.statusCode} body=${body.slice(0, 500)} model=${config.openai.realtimeModel}`,
+        );
+      });
+    });
   }
 
   onOpenAIOpen() {
