@@ -39,6 +39,27 @@ const repo = require('./callSessionRepo');
 // ends before the WS arrives.
 const bridges = new Map();
 
+// callControlIds we've already seen call.hangup for. If Telnyx's media
+// WS races and arrives AFTER the hangup webhook, the lazy-create path
+// would otherwise spin up an orphan bridge that has no hangup signal
+// and sits open until Telnyx times out the stream (observed: 11 min).
+// Retain for 60s — long enough to catch the race, short enough to free
+// memory on a long-running process.
+const hungUpCallIds = new Map(); // ccid → expiry timestamp ms
+function markHungUp(ccid) {
+  if (!ccid) return;
+  hungUpCallIds.set(ccid, Date.now() + 60_000);
+}
+function wasHungUp(ccid) {
+  const exp = hungUpCallIds.get(ccid);
+  if (!exp) return false;
+  if (Date.now() > exp) {
+    hungUpCallIds.delete(ccid);
+    return false;
+  }
+  return true;
+}
+
 // Bridges that have prepared OpenAI but haven't seen a Telnyx WS yet,
 // in arrival order. Telnyx's `start` event carries the call_control_id
 // so we don't actually need this fallback, but keep a short retention
@@ -150,6 +171,10 @@ class RealtimeBridge {
     this.sendOpenAI({
       type: 'session.update',
       session: {
+        // GA requires a `type` discriminator on the session object —
+        // 'realtime' is the only value for the Realtime API. Omitting
+        // it returns: Missing required parameter: 'session.type'.
+        type: 'realtime',
         instructions,
         output_modalities: ['audio'],
         audio: {
@@ -407,6 +432,16 @@ function attachToWebSocket(ws) {
       return;
     }
 
+    if (wasHungUp(ccid)) {
+      // Race: call.hangup webhook arrived before Telnyx's media WS.
+      // Without this guard the lazy-create branch below would build a
+      // brand-new bridge that has no hangup signal and would survive
+      // until Telnyx times out the stream (observed: 11 minutes).
+      console.warn(`[bridge] ws arrived for hung-up call ccid=${ccid.slice(0, 8)}… — closing`);
+      try { ws.close(); } catch (_) {}
+      return;
+    }
+
     let bridge = bridges.get(ccid);
     if (!bridge) {
       // Late attach: webhook handler hasn't created the bridge yet.
@@ -435,6 +470,10 @@ function attachToWebSocket(ws) {
 }
 
 function shutdownBridgeByCallControlId(ccid, reason = 'external') {
+  // Record the hangup regardless of whether a bridge currently exists,
+  // so a late-arriving Telnyx WS for this call is rejected by the
+  // attach handler instead of spinning up an orphan bridge.
+  if (reason === 'call_hangup') markHungUp(ccid);
   const b = bridges.get(ccid);
   if (b) b.shutdown(reason);
 }
