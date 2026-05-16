@@ -248,7 +248,45 @@ class RealtimeBridge {
       this.shutdown('telnyx_error');
     });
 
+    // Start streaming μ-law silence immediately so the carrier sees an
+    // active media path. Observed behaviour without this: the call gets
+    // dropped at ~1.5-2s before OpenAI produces real audio, presumably
+    // because either the carrier or Telnyx's own watchdog terminates a
+    // leg that has no outbound media activity. The interval is canceled
+    // by sendTelnyxMedia() the moment the first real OpenAI audio
+    // frame arrives.
+    this.startComfortNoise();
+
     this.maybeSendGreeting();
+  }
+
+  startComfortNoise() {
+    if (this.comfortNoiseTimer) return;
+    // 20ms of μ-law silence = 160 bytes of 0xFF (μ-law silence value).
+    // Pre-encoded once so we're not allocating each tick.
+    if (!RealtimeBridge.silenceFrameB64) {
+      RealtimeBridge.silenceFrameB64 = Buffer.alloc(160, 0xff).toString('base64');
+    }
+    const frame = RealtimeBridge.silenceFrameB64;
+    this.comfortNoiseTimer = setInterval(() => {
+      if (!this.telnyxWs || this.telnyxWs.readyState !== WebSocket.OPEN) return;
+      if (!this.streamId) return;
+      // Use raw send (NOT sendTelnyxMedia) so we don't accidentally
+      // cancel the timer from inside its own tick.
+      this.sendTelnyx({
+        event: 'media',
+        stream_id: this.streamId,
+        media: { payload: frame },
+      });
+    }, 20);
+    // unref so it doesn't keep the process alive during shutdown.
+    this.comfortNoiseTimer.unref?.();
+  }
+
+  stopComfortNoise() {
+    if (!this.comfortNoiseTimer) return;
+    clearInterval(this.comfortNoiseTimer);
+    this.comfortNoiseTimer = null;
   }
 
   handleTelnyxMessage(raw) {
@@ -332,6 +370,10 @@ class RealtimeBridge {
 
   sendTelnyxMedia(b64ulaw) {
     if (!this.streamId) return;
+    // First real audio from OpenAI — stop pumping silence so we don't
+    // mix comfort frames in with the AI's voice (Telnyx will play
+    // every frame we send in order).
+    if (this.comfortNoiseTimer) this.stopComfortNoise();
     this.sendTelnyx({
       event: 'media',
       stream_id: this.streamId,
@@ -363,6 +405,7 @@ class RealtimeBridge {
     console.log(
       `[bridge] shutdown reason=${reason} ccid=${this.callControlId?.slice(0, 8) || '?'}…`,
     );
+    this.stopComfortNoise();
     bridges.delete(this.callControlId);
     try { this.openaiWs?.close(); } catch (_) {}
     try { this.telnyxWs?.close(); } catch (_) {}
