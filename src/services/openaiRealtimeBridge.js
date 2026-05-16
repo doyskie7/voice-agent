@@ -146,6 +146,7 @@ class RealtimeBridge {
     this.sendOpenAI({
       type: 'session.update',
       session: {
+        type: 'realtime',
         modalities: ['audio'],
         instructions,
         voice: 'shimmer',
@@ -182,7 +183,7 @@ class RealtimeBridge {
     this.sendOpenAI({
       type: 'response.create',
       response: {
-        modalities: ['audio'],
+        output_modalities: ['audio'],
         instructions: `אמור עכשיו את ברכת הפתיחה הבאה בעברית בקול חם וטבעי: "${this.greeting}". אל תוסיף דבר אחריה — חכה שהמתקשר ידבר.`,
       },
     });
