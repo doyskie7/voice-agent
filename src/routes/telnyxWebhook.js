@@ -115,16 +115,27 @@ async function handleInitiated(ev, callControlId, callLegId) {
     toNumber,
   });
 
+  // Open the OpenAI WS NOW while the phone is still ringing. By the time
+  // call.answered fires (~1.2s later), the TLS handshake and session.update
+  // are already done — the caller hears the greeting within ~300ms of pickup.
+  realtimeBridge.prepare(callControlId).catch((err) =>
+    console.error('[telnyx/webhook] bridge pre-prepare failed:', err.message),
+  );
+
   try {
     await telnyx.answer(callControlId);
   } catch (err) {
     console.error('[telnyx/webhook] answer failed:', err.response?.data || err.message);
+    realtimeBridge.shutdownBridgeByCallControlId(callControlId, 'answer_failed');
     await repo.markCompleted(callControlId, { status: 'failed' });
   }
 }
 
 async function handleAnswered(ev, callControlId) {
-  await repo.markAnswered(callControlId);
+  // Don't await — non-critical write, and we want streaming_start ASAP.
+  repo.markAnswered(callControlId).catch((err) =>
+    console.warn('[telnyx/webhook] markAnswered failed:', err.message),
+  );
 
   if (!config.publicHostname) {
     console.error('[telnyx/webhook] PUBLIC_HOSTNAME missing — cannot start media streaming');
@@ -132,15 +143,10 @@ async function handleAnswered(ev, callControlId) {
     return;
   }
 
-  // Telnyx will dial this URL to push/pull audio frames. The path must
-  // match the WS upgrade handler in server.js.
   const streamUrl = `wss://${config.publicHostname}/ws/media`;
 
-  // Open the OpenAI Realtime WS NOW, in parallel with streaming_start,
-  // so by the time Telnyx connects to /ws/media the AI is already
-  // configured and can start speaking immediately. This shaves ~1s of
-  // silence after pickup, which is the difference between callers
-  // hearing the greeting vs. hanging up thinking the line is dead.
+  // prepare() was already called in handleInitiated (bridge is pre-warming).
+  // This is a no-op if the bridge exists; belt-and-suspenders for retries.
   realtimeBridge.prepare(callControlId).catch((err) =>
     console.error('[telnyx/webhook] bridge prepare failed:', err.message),
   );

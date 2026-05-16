@@ -86,32 +86,46 @@ class RealtimeBridge {
     }
   }
 
-  connectOpenAI() {
+  connectOpenAI(attempt = 1) {
+    if (this.closed) return;
     if (!config.openai.apiKey) {
       console.error('[bridge] OPENAI_API_KEY missing');
       return this.shutdown('no_openai_key');
     }
-    const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(config.openai.realtimeModel)}`;
-    this.openaiWs = new WebSocket(url, {
+    const model = config.openai.realtimeModel;
+    const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
+    console.log(`[bridge] openai ws connecting attempt=${attempt} model=${model}`);
+    const ws = new WebSocket(url, {
       headers: { Authorization: `Bearer ${config.openai.apiKey}` },
     });
-    this.openaiWs.on('open', () => this.onOpenAIOpen());
-    this.openaiWs.on('message', (raw) => this.handleOpenAIMessage(raw));
-    this.openaiWs.on('close', (code, reason) => {
-      console.log(`[bridge] openai ws closed code=${code} reason=${reason?.toString() || ''}`);
-      this.shutdown('openai_close');
+    this.openaiWs = ws;
+
+    ws.on('open', () => { if (!this.closed) this.onOpenAIOpen(); });
+    ws.on('message', (raw) => { if (!this.closed) this.handleOpenAIMessage(raw); });
+    ws.on('error', (err) => {
+      console.error(`[bridge] openai ws error attempt=${attempt}:`, err.message);
     });
-    this.openaiWs.on('error', (err) => {
-      console.error('[bridge] openai ws error:', err.message);
+    ws.on('close', (code, reason) => {
+      const r = reason?.toString() || '';
+      console.log(`[bridge] openai ws closed code=${code} reason=${r} attempt=${attempt}`);
+      // Retry on abnormal closure (1006 = TCP-level drop, not an auth error).
+      // Don't retry if bridge is already closed or we've already opened successfully.
+      if (!this.closed && !this.openaiReady && code !== 1000 && attempt < 3) {
+        const delay = attempt * 300;
+        console.log(`[bridge] retrying openai ws in ${delay}ms`);
+        setTimeout(() => { if (!this.closed) this.connectOpenAI(attempt + 1); }, delay);
+      } else {
+        this.shutdown('openai_close');
+      }
     });
-    // Exposes the real HTTP status/body when the upgrade is rejected (401, 403, 404, etc.)
-    this.openaiWs.on('unexpected-response', (_req, res) => {
+    // Fires when OpenAI responds with a non-101 HTTP status (401, 403, 404…).
+    // Log status immediately so we don't miss it if the connection closes before body ends.
+    ws.on('unexpected-response', (_req, res) => {
+      console.error(`[bridge] openai upgrade rejected status=${res.statusCode} model=${model} attempt=${attempt}`);
       let body = '';
       res.on('data', (c) => { body += c.toString(); });
       res.on('end', () => {
-        console.error(
-          `[bridge] openai upgrade rejected status=${res.statusCode} body=${body.slice(0, 500)} model=${config.openai.realtimeModel}`,
-        );
+        console.error(`[bridge] openai upgrade rejected body=${body.slice(0, 500)}`);
       });
     });
   }

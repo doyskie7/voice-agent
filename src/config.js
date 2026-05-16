@@ -24,10 +24,11 @@ module.exports = {
 
   openai: {
     apiKey: process.env.OPENAI_API_KEY || '',
-    // Realtime model — fast 4o variant. Locked to the dated snapshot to
-    // avoid surprise behavior changes when OpenAI rolls a new build.
+    // Realtime model. The alias 'gpt-4o-realtime-preview' always points to
+    // the current supported snapshot — safer than pinning a dated version
+    // that OpenAI may deprecate without notice.
     realtimeModel:
-      process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview-2024-12-17',
+      process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview',
   },
 
   // Bridge into claude-agent's existing HTTP API. Voice agent never
